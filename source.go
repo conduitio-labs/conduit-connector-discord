@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 
 	sdk "github.com/conduitio/conduit-connector-sdk"
 	"golang.org/x/time/rate"
@@ -29,10 +28,13 @@ import (
 type Source struct {
 	sdk.UnimplementedSource
 
-	config  SourceConfig
-	client  *http.Client
-	limiter *rate.Limiter
-	header  http.Header
+	config   SourceConfig
+	position sdk.Position
+	messages chan sdk.StructuredData
+	errs     chan error
+	client   *http.Client
+	limiter  *rate.Limiter
+	header   http.Header
 }
 
 func NewSource() sdk.Source {
@@ -47,7 +49,7 @@ func (s *Source) Configure(ctx context.Context, cfg map[string]string) error {
 	sdk.Logger(ctx).Info().Msg("Configuring Source...")
 	config, header, err := s.config.ParseConfig(cfg)
 	if err != nil {
-		return fmt.Errorf("invalid config: %w", err) // test
+		return fmt.Errorf("invalid config: %w", err)
 	}
 	s.config = config
 	s.header = header
@@ -59,14 +61,15 @@ func (s *Source) Open(ctx context.Context, pos sdk.Position) error {
 	s.client = &http.Client{}
 
 	// check connection
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, s.config.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, s.config.url, nil)
 	if err != nil {
-		return fmt.Errorf("error creating HTTP request %q: %w", s.config.URL, err)
+		return fmt.Errorf("error creating HTTP request %q: %w", s.config.url, err)
 	}
+	// set headers
 	req.Header = s.header
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("error pinging URL %q: %w", s.config.URL, err)
+		return fmt.Errorf("error pinging URL %q: %w", s.config.url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
@@ -74,79 +77,142 @@ func (s *Source) Open(ctx context.Context, pos sdk.Position) error {
 	}
 
 	s.limiter = rate.NewLimiter(rate.Every(s.config.PollingPeriod), 1)
+	s.position = pos
+	s.messages = make(chan sdk.StructuredData, 10)
+	s.errs = make(chan error)
+
+	// spawn go routine
+	go s.getRecords(ctx)
 
 	return nil
 }
 
 func (s *Source) Read(ctx context.Context) (sdk.Record, error) {
-	// Read returns a new Record and is supposed to block until there is either
-	// a new record or the context gets cancelled. It can also return the error
-	// ErrBackoffRetry to signal to the SDK it should call Read again with a
-	// backoff retry.
-	// If Read receives a cancelled context or the context is cancelled while
-	// Read is running it must stop retrieving new records from the source
-	// system and start returning records that have already been buffered. If
-	// there are no buffered records left Read must return the context error to
-	// signal a graceful stop. If Read returns ErrBackoffRetry while the context
-	// is cancelled it will also signal that there are no records left and Read
-	// won't be called again.
-	// After Read returns an error the function won't be called again (except if
-	// the error is ErrBackoffRetry, as mentioned above).
-	// Read can be called concurrently with Ack.
-
-	// TODO: Use ErrBackoffRetry when there's nothing new to process.
-	err := s.limiter.Wait(ctx)
-	if err != nil {
+	select {
+	case msg := <-s.messages:
+		rec, err := s.createRecord(msg)
+		if err != nil {
+			return sdk.Record{}, fmt.Errorf("error creating record: %w", err)
+		}
+		return rec, nil
+	case err := <-s.errs:
 		return sdk.Record{}, err
+	case <-ctx.Done():
+		return sdk.Record{}, ctx.Err()
+	default:
+		return sdk.Record{}, sdk.ErrBackoffRetry
 	}
-	rec, err := s.getRecord(ctx)
-	if err != nil {
-		return sdk.Record{}, fmt.Errorf("error getting data: %w", err)
+}
+
+func (s *Source) getRecords(ctx context.Context) {
+	for {
+		// get response body
+		body, err := s.getResponse(ctx)
+		if err != nil {
+			s.errs <- fmt.Errorf("failed to get response: %w", err)
+			return
+		}
+
+		// parse json array
+		var msgs []sdk.StructuredData
+		err = json.Unmarshal(body, &msgs)
+		if err != nil {
+			s.errs <- fmt.Errorf("failed to unmarshal body as JSON Array: %w", err)
+			return
+		}
+
+		// validate messages
+		err = s.validateMessages(msgs)
+		if err != nil {
+			s.errs <- fmt.Errorf("invalid message format: %w", err)
+			return
+		}
+
+		// loop in reverse, to start with the oldest message
+		for i := len(msgs) - 1; i >= 0; i-- {
+			s.messages <- msgs[i]
+			if i == 0 {
+				// first message in the slice, is the latest message in the channel, so start reading messages
+				// from after this one
+				s.position = sdk.Position(msgs[i]["id"].(string))
+			}
+		}
+
+		// delay
+		err = s.limiter.Wait(ctx)
+		if err != nil {
+			s.errs <- err
+			return
+		}
+	}
+}
+
+func (s *Source) createRecord(msg sdk.StructuredData) (sdk.Record, error) {
+	id := msg["id"].(string)
+	rec := sdk.Record{
+		Payload: sdk.Change{
+			Before: nil,
+			After:  msg,
+		},
+		Operation: sdk.OperationCreate,
+		Position:  sdk.Position(id),
+		Key:       sdk.RawData(id),
 	}
 	return rec, nil
 }
 
-func (s *Source) getRecord(ctx context.Context) (sdk.Record, error) {
+func (s *Source) validateMessages(msgs []sdk.StructuredData) error {
+	for _, msg := range msgs {
+		if _, ok := msg["id"].(string); !ok {
+			return fmt.Errorf("id field not found")
+		}
+		if _, ok := msg["content"].(string); !ok {
+			return fmt.Errorf("content field not found")
+		}
+		if _, ok := msg["type"]; !ok {
+			return fmt.Errorf("type field not found")
+		}
+		author, ok := msg["author"].(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("author field not found")
+		}
+		if _, ok := author["username"].(string); !ok {
+			return fmt.Errorf("author.username field not found")
+		}
+	}
+	// type 7 joined the server
+	// type 19 is a reply
+	// type 0 is default
+	return nil
+}
+
+func (s *Source) getResponse(ctx context.Context) ([]byte, error) {
+	url := s.config.url
+	if s.position != nil {
+		url = s.config.url + "?after=" + string(s.position)
+	}
 	// create GET request
-	req, err := http.NewRequestWithContext(ctx, s.config.Method, s.config.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return sdk.Record{}, fmt.Errorf("error creating HTTP request: %w", err)
+		return nil, fmt.Errorf("error creating HTTP request: %w", err)
 	}
 	req.Header = s.header
 	// get response
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return sdk.Record{}, fmt.Errorf("error getting data from URL: %w", err)
+		return nil, fmt.Errorf("error getting data from URL: %w", err)
 	}
 	defer resp.Body.Close()
 	// check response status
 	if resp.StatusCode != http.StatusOK {
-		return sdk.Record{}, fmt.Errorf("response status should be %v, got status=%v", http.StatusOK, resp.StatusCode)
+		return nil, fmt.Errorf("response status should be %v, got status=%v", http.StatusOK, resp.StatusCode)
 	}
 	// read body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return sdk.Record{}, fmt.Errorf("error reading body for response %v: %w", resp, err)
+		return nil, fmt.Errorf("error reading body for response %v: %w", resp, err)
 	}
-	// parse json
-	var structData []sdk.StructuredData
-	err = json.Unmarshal(body, &structData)
-	if err != nil {
-		return sdk.Record{}, fmt.Errorf("failed to unmarshal body as JSON: %w", err)
-	}
-	// create record
-	now := time.Now().Unix()
-
-	rec := sdk.Record{
-		Payload: sdk.Change{
-			Before: nil,
-			After:  structData[0],
-		},
-		Operation: sdk.OperationCreate,
-		Position:  sdk.Position(fmt.Sprintf("unix-%v", now)),
-		Key:       sdk.RawData(fmt.Sprintf("%v", now)),
-	}
-	return rec, nil
+	return body, nil
 }
 
 func (s *Source) Ack(ctx context.Context, position sdk.Position) error {
@@ -157,6 +223,12 @@ func (s *Source) Ack(ctx context.Context, position sdk.Position) error {
 func (s *Source) Teardown(ctx context.Context) error {
 	if s.client != nil {
 		s.client.CloseIdleConnections()
+	}
+	if s.messages != nil {
+		close(s.messages)
+	}
+	if s.errs != nil {
+		close(s.errs)
 	}
 	return nil
 }

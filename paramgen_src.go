@@ -9,31 +9,13 @@ import (
 
 func (SourceConfig) Parameters() map[string]sdk.Parameter {
 	return map[string]sdk.Parameter{
-		"body": {
+		"channel-id": {
 			Default:     "",
-			Description: "Http body to use in the request",
-			Type:        sdk.ParameterTypeString,
-			Validations: []sdk.Validation{},
-		},
-		"headers": {
-			Default:     "",
-			Description: "Http headers to use in the request, comma separated list of : separated pairs",
-			Type:        sdk.ParameterTypeString,
-			Validations: []sdk.Validation{},
-		},
-		"method": {
-			Default:     "GET",
-			Description: "Http method to use in the request",
+			Description: "channel id",
 			Type:        sdk.ParameterTypeString,
 			Validations: []sdk.Validation{
-				sdk.ValidationInclusion{List: []string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "CONNECT", "OPTIONS", "TRACE"}},
+				sdk.ValidationRequired{},
 			},
-		},
-		"params": {
-			Default:     "",
-			Description: "parameters to use in the request, & separated list of = separated pairs",
-			Type:        sdk.ParameterTypeString,
-			Validations: []sdk.Validation{},
 		},
 		"pollingPeriod": {
 			Default:     "5m",
@@ -41,9 +23,15 @@ func (SourceConfig) Parameters() map[string]sdk.Parameter {
 			Type:        sdk.ParameterTypeDuration,
 			Validations: []sdk.Validation{},
 		},
-		"url": {
+		"snapshot": {
+			Default:     "false",
+			Description: "todo",
+			Type:        sdk.ParameterTypeBool,
+			Validations: []sdk.Validation{},
+		},
+		"token": {
 			Default:     "",
-			Description: "Http url to use in the request",
+			Description: "bot token",
 			Type:        sdk.ParameterTypeString,
 			Validations: []sdk.Validation{
 				sdk.ValidationRequired{},
