@@ -47,7 +47,7 @@ func (s *Source) Configure(ctx context.Context, cfg map[string]string) error {
 	sdk.Logger(ctx).Info().Msg("Configuring Source...")
 	config, header, err := s.config.ParseConfig(cfg)
 	if err != nil {
-		return fmt.Errorf("invalid config: %w", err)
+		return fmt.Errorf("invalid config: %w", err) // test
 	}
 	s.config = config
 	s.header = header
